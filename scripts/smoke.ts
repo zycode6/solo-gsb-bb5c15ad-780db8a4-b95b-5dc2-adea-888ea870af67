@@ -1,7 +1,8 @@
 import { buildBaseline, compareWithBaseline, mergeRanges } from '../src/lib/baseline'
 import { ipToInt, prefixForHosts } from '../src/lib/ip'
 import { plan } from '../src/lib/planner'
-import type { PlannerInput } from '../src/lib/types'
+import { blocksToCidrList, summarizeSegments } from '../src/lib/summary'
+import type { PlannerInput, Segment } from '../src/lib/types'
 
 let failures = 0
 function check(name: string, cond: boolean, extra = '') {
@@ -438,6 +439,202 @@ check(
   '区间合并去重（相交+相邻）',
   mr.length === 1 && mr[0].start === ipToInt('10.0.0.0') && mr[0].end === ipToInt('10.0.0.30'),
   JSON.stringify(mr),
+)
+
+// 14) 路由汇总：空选择
+check('空选择汇总为空', summarizeSegments([]).blocks.length === 0)
+
+// 14a) 单选即自身（固定段），地址数守恒
+const sumInput: PlannerInput = {
+  parentCidr: '10.0.0.0/24',
+  reservations: [{ id: 'r1', name: '保留', cidr: '10.0.0.0/28' }],
+  requirements: [
+    { id: 'q1', name: '办公', hosts: 100, cidr: '' },
+    { id: 'q2', name: '机房', hosts: 40, cidr: '' },
+    { id: 'q3', name: '监控固定', hosts: 25, cidr: '10.0.0.32/27' },
+    { id: 'q4', name: '管理', hosts: 2, cidr: '' },
+  ],
+}
+const sumPlan = plan(sumInput)
+check('汇总场景无错误', sumPlan.inputErrors.length === 0, JSON.stringify(sumPlan.inputErrors))
+const byId = new Map<string, Segment>()
+for (const s of sumPlan.segments) if (s.ownerId) byId.set(s.ownerId, s)
+
+const one = summarizeSegments([byId.get('q3')!])
+check(
+  '单选固定段返回自身',
+  one.blocks.length === 1 && one.blocks[0].cidr === '10.0.0.32/27' && !one.blocks[0].aggregated,
+  JSON.stringify(one.blocks),
+)
+check('单选地址数 32 且来源正确', one.blocks[0].capacity === 32 && one.blocks[0].sources[0].id === 'q3')
+
+// 14b) 四个连续 /30（16/20/24/28）全选 -> 10.0.0.16/28（仅同上级网段才聚合）
+const chainInput: PlannerInput = {
+  parentCidr: '10.0.0.0/27',
+  reservations: [{ id: 'r', name: '保留', cidr: '10.0.0.0/28' }],
+  requirements: [
+    { id: 'a', name: 'A', hosts: 2, cidr: '' },
+    { id: 'b', name: 'B', hosts: 2, cidr: '' },
+    { id: 'c', name: 'C', hosts: 2, cidr: '' },
+    { id: 'd', name: 'D', hosts: 2, cidr: '' },
+  ],
+}
+const chainPlan = plan(chainInput)
+check(
+  '四个连续 /30 落在 16/20/24/28',
+  JSON.stringify(chainPlan.segments.filter((s) => s.kind === 'auto').map((s) => s.cidr)) ===
+    JSON.stringify(['10.0.0.16/30', '10.0.0.20/30', '10.0.0.24/30', '10.0.0.28/30']),
+  JSON.stringify(chainPlan.segments.map((s) => s.cidr)),
+)
+const allChain = summarizeSegments(chainPlan.segments.filter((s) => s.kind === 'auto'))
+check(
+  '四个连续 /30 聚合为 16/28',
+  allChain.blocks.length === 1 && allChain.blocks[0].cidr === '10.0.0.16/28' && allChain.blocks[0].aggregated,
+  JSON.stringify(allChain.blocks),
+)
+check(
+  '聚合块列出全部 4 个原需求且地址数守恒（16）',
+  allChain.blocks[0].sources.map((x) => x.id).join(',') === 'a,b,c,d' &&
+    allChain.totalAddresses === 16 &&
+    allChain.blocks[0].sources.reduce((n, s) => n + s.capacity, 0) === 16,
+)
+
+// 14c) 跳过中间未选：选 16/30 + 24/30（中间 20 空闲于选择外），不得聚合
+const gapped = summarizeSegments(
+  chainPlan.segments.filter((s) => s.kind === 'auto' && (s.cidr === '10.0.0.16/30' || s.cidr === '10.0.0.24/30')),
+)
+check(
+  '不相邻选择保持两个 /30（不吞入中间未选地址）',
+  gapped.blocks.length === 2 && gapped.blocks.every((b) => b.prefix === 30) && gapped.totalAddresses === 8,
+  JSON.stringify(gapped.blocks.map((b) => b.cidr)),
+)
+
+// 14d) 不相邻（/30 与 /26 间有空闲）保持两项，不吞入空闲地址
+const mixed = summarizeSegments([byId.get('q4')!, byId.get('q2')!])
+check(
+  '中间隔着空闲的两段不聚合（/30 + /26 保持两项）',
+  mixed.blocks.length === 2 &&
+    JSON.stringify(mixed.blocks.map((b) => b.cidr)) === JSON.stringify(['10.0.0.16/30', '10.0.0.64/26']),
+  JSON.stringify(mixed.blocks.map((b) => b.cidr)),
+)
+
+// 14e) 同前缀连续但分属不同上级：4/30 与 8/30 的上级 /29 分别是 0/29、8/29 -> 不聚合（固定段）
+const sibInput: PlannerInput = {
+  parentCidr: '10.0.0.0/28',
+  reservations: [],
+  requirements: [
+    { id: 'x', name: 'X', hosts: 2, cidr: '10.0.0.4/30' },
+    { id: 'y', name: 'Y', hosts: 2, cidr: '10.0.0.8/30' },
+  ],
+}
+const sibPlan = plan(sibInput)
+check('跨上级 /30 固定段无错误', sibPlan.inputErrors.length === 0, JSON.stringify(sibPlan.inputErrors))
+const sib = summarizeSegments(sibPlan.segments.filter((s) => s.kind === 'fixed'))
+check(
+  '跨上级兄弟 /30 不聚合（4/30 + 8/30）',
+  sib.blocks.length === 2 && sib.blocks.map((b) => b.cidr).join(',') === '10.0.0.4/30,10.0.0.8/30',
+  JSON.stringify(sib.blocks.map((b) => b.cidr)),
+)
+
+// 14e2) 对照组：同一上级内的 0/30 + 4/30 必须聚合为 0/29
+const sameParentInput: PlannerInput = {
+  parentCidr: '10.0.0.0/28',
+  reservations: [],
+  requirements: [
+    { id: 'x', name: 'X', hosts: 2, cidr: '10.0.0.0/30' },
+    { id: 'y', name: 'Y', hosts: 2, cidr: '10.0.0.4/30' },
+  ],
+}
+const sameParent = summarizeSegments(plan(sameParentInput).segments.filter((s) => s.kind === 'fixed'))
+check(
+  '同上级兄弟 /30 聚合为 0/29',
+  sameParent.blocks.length === 1 && sameParent.blocks[0].cidr === '10.0.0.0/29' && sameParent.blocks[0].aggregated,
+  JSON.stringify(sameParent.blocks.map((b) => b.cidr)),
+)
+
+// 14f) 三个连续 /30（0/4/8）-> 0/29 + 8/30：最小块数的对齐拆分
+const threeInput: PlannerInput = {
+  parentCidr: '10.0.0.0/28',
+  reservations: [{ id: 'r', name: '保留', cidr: '10.0.0.12/30' }],
+  requirements: [
+    { id: 'a', name: 'A', hosts: 2, cidr: '' },
+    { id: 'b', name: 'B', hosts: 2, cidr: '' },
+    { id: 'c', name: 'C', hosts: 2, cidr: '' },
+  ],
+}
+const threePlan = plan(threeInput)
+const three = summarizeSegments(threePlan.segments.filter((s) => s.kind === 'auto'))
+check(
+  '三个连续 /30 拆为 0/29 + 8/30（地址对齐边界）',
+  three.blocks.length === 2 &&
+    three.blocks[0].cidr === '10.0.0.0/29' &&
+    three.blocks[1].cidr === '10.0.0.8/30' &&
+    three.totalAddresses === 12,
+  JSON.stringify(three.blocks.map((b) => [b.cidr, b.capacity])),
+)
+check(
+  '0/29 仅覆盖前两段，8/30 覆盖第三段（来源不串行）',
+  three.blocks[0].sources.map((s) => s.id).join(',') === 'a,b' &&
+    three.blocks[0].aggregated &&
+    three.blocks[1].sources.map((s) => s.id).join(',') === 'c',
+  JSON.stringify(three.blocks.map((b) => b.sources.map((s) => s.id))),
+)
+check('不得纳入保留区 12/30', !blocksToCidrList(three.blocks).includes('10.0.0.12/30'))
+
+// 14g) 复制文本：按网络地址升序、每行一个纯 CIDR
+const partial = summarizeSegments([byId.get('q1')!, byId.get('q4')!, byId.get('q3')!])
+check(
+  'CIDR 列表按网络地址升序',
+  blocksToCidrList(partial.blocks) === '10.0.0.16/30\n10.0.0.32/27\n10.0.0.128/25',
+  blocksToCidrList(partial.blocks),
+)
+
+// 14h) 覆盖精确性：任意勾选并集大小 = 结果块容量之和（不重不漏，不含保留/空闲）
+for (let mask = 1; mask < 16; mask++) {
+  const ids = ['q1', 'q2', 'q3', 'q4']
+  const picked = ids.filter((_, i) => mask & (1 << i)).map((id) => byId.get(id)!)
+  const res = summarizeSegments(picked)
+  const expect = picked.reduce((n, s) => n + s.capacity, 0)
+  check(
+    `覆盖守恒 mask=${mask}`,
+    res.totalAddresses === expect &&
+      res.blocks.reduce((n, b) => n + b.capacity, 0) === expect &&
+      res.blocks.every((b) => b.sources.length >= 1),
+    `mask=${mask} got ${res.totalAddresses} expect ${expect}`,
+  )
+  // 每个汇总块不得与保留区 0/28 或空闲地址相交：块内每个地址都必须属于某个被选段
+  const occupied = picked
+    .map((s) => ({ start: s.start, end: s.end }))
+    .sort((a, b) => a.start - b.start)
+  for (const b of res.blocks) {
+    // 用来源并集精确比对块边界
+    const own = b.sources
+      .map((s) => ({ start: s.start, end: s.end }))
+      .sort((a, b2) => a.start - b2.start)
+    let cur = own[0].start
+    for (const o of own) {
+      if (o.start > cur) break
+      cur = Math.max(cur, o.end + 1)
+    }
+    check(
+      `精确覆盖 mask=${mask} block=${b.cidr}`,
+      own[0].start === b.network && cur - 1 === b.network + b.capacity - 1,
+      `block ${b.cidr} 与来源不匹配`,
+    )
+  }
+}
+
+// 14i) 全选示例（固定+自动）不越界包含保留区 0/28，块数最少
+const full = summarizeSegments(sumPlan.segments.filter((s) => s.kind === 'fixed' || s.kind === 'auto'))
+check(
+  '全选示例不包含保留区，且结果不含 0/28',
+  !full.blocks.some((b) => b.network === ipToInt('10.0.0.0') && b.prefix === 28),
+  JSON.stringify(full.blocks.map((b) => b.cidr)),
+)
+check(
+  '全选示例覆盖 = 100/25+40/26+32/27+4/30 = 228',
+  full.totalAddresses === 228,
+  String(full.totalAddresses),
 )
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)

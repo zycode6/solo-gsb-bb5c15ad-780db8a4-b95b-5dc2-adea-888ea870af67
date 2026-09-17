@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import AddressBar from './components/AddressBar'
 import BaselinePanel from './components/BaselinePanel'
+import RouteSummaryPanel from './components/RouteSummaryPanel'
 import SegmentDetail from './components/SegmentDetail'
 import SegmentTable from './components/SegmentTable'
 import SummaryCards from './components/SummaryCards'
@@ -296,6 +297,8 @@ export default function App() {
         onSave={handleSaveBaseline}
         onClear={handleClearBaseline}
       />
+
+      <RouteSummaryPanel result={result} />
 
       {result.segments.length > 0 && (
         <div className="panel">
