@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/components/AddressBar.tsx","./src/components/BaselinePanel.tsx","./src/components/SegmentDetail.tsx","./src/components/SegmentTable.tsx","./src/components/SummaryCards.tsx","./src/lib/baseline.ts","./src/lib/exporter.ts","./src/lib/ip.ts","./src/lib/planner.ts","./src/lib/types.ts"],"version":"5.9.3"}
