@@ -1,7 +1,12 @@
 import { buildBaseline, compareWithBaseline, mergeRanges } from '../src/lib/baseline'
-import { ipToInt, prefixForHosts } from '../src/lib/ip'
+import { ipToInt, parseCidr, prefixForHosts } from '../src/lib/ip'
 import { plan } from '../src/lib/planner'
-import type { PlannerInput } from '../src/lib/types'
+import {
+  blocksCoverExactly,
+  selectableSegments,
+  summarizeRoutes,
+} from '../src/lib/summarize'
+import type { PlannerInput, RouteSummaryBlock, SummaryMember } from '../src/lib/types'
 
 let failures = 0
 function check(name: string, cond: boolean, extra = '') {
@@ -439,6 +444,228 @@ check(
   mr.length === 1 && mr[0].start === ipToInt('10.0.0.0') && mr[0].end === ipToInt('10.0.0.30'),
   JSON.stringify(mr),
 )
+
+// 14) 路由汇总（CIDR 聚合）
+function member(id: string, cidr: string, name = id, kind: 'fixed' | 'auto' = 'auto'): SummaryMember {
+  const p = parseCidr(cidr)
+  if ('error' in p) throw new Error(p.error)
+  return { id, name, kind, cidr, prefix: p.prefix, start: p.network, end: p.broadcast }
+}
+const cidrsOf = (bs: RouteSummaryBlock[]) => bs.map((b) => b.cidr)
+function toMemberFromSegment(s: ReturnType<typeof selectableSegments>[number]): SummaryMember {
+  return {
+    id: s.ownerId,
+    name: s.name,
+    kind: s.kind,
+    cidr: s.cidr,
+    prefix: s.prefix,
+    start: s.start,
+    end: s.end,
+  }
+}
+
+// 14a) 单个网段原样返回
+check(
+  '汇总：单个 /28 原样返回',
+  JSON.stringify(cidrsOf(summarizeRoutes([member('a', '10.0.0.0/28')]))) ===
+    JSON.stringify(['10.0.0.0/28']),
+)
+
+// 14b) 两个同前缀、连续且同属一个上级网段 -> 聚合
+check(
+  '汇总：相邻同上级 /30 聚合成 /29',
+  JSON.stringify(cidrsOf(summarizeRoutes([member('a', '10.0.0.0/30'), member('b', '10.0.0.4/30')]))) ===
+    JSON.stringify(['10.0.0.0/29']),
+)
+
+// 14c) 连续但分属不同上级网段 -> 不得聚合
+check(
+  '汇总：4/30 与 8/30 分属不同 /29，不聚合',
+  JSON.stringify(cidrsOf(summarizeRoutes([member('a', '10.0.0.4/30'), member('b', '10.0.0.8/30')]))) ===
+    JSON.stringify(['10.0.0.4/30', '10.0.0.8/30']),
+)
+
+// 14d) 中间有空闲间隙 -> 不得跨越聚合
+check(
+  '汇总：0/30 与 8/30 间隔空闲，不聚合',
+  JSON.stringify(cidrsOf(summarizeRoutes([member('a', '10.0.0.0/30'), member('b', '10.0.0.8/30')]))) ===
+    JSON.stringify(['10.0.0.0/30', '10.0.0.8/30']),
+)
+
+// 14e) 三个连续 /30（8 地址区间）-> /29 + /30，数量最少且不越界
+check(
+  '汇总：三个连续 /30 -> /29 + /30（无 /31）',
+  JSON.stringify(cidrsOf(summarizeRoutes([
+    member('a', '10.0.0.0/30'),
+    member('b', '10.0.0.4/30'),
+    member('c', '10.0.0.8/30'),
+  ]))) === JSON.stringify(['10.0.0.0/29', '10.0.0.8/30']),
+)
+
+// 14f) 四个连续 /30 -> 单个 /28
+check(
+  '汇总：四个连续 /30 -> /28',
+  JSON.stringify(cidrsOf(summarizeRoutes([
+    member('a', '10.0.0.0/30'),
+    member('b', '10.0.0.4/30'),
+    member('c', '10.0.0.8/30'),
+    member('d', '10.0.0.12/30'),
+  ]))) === JSON.stringify(['10.0.0.0/28']),
+)
+
+// 14g) 跨边界的大量连续 /30：0/28 + 32/27 合并为 32-3=32，0..31 单独 /27
+//  选 0/28（16）+ 16/30（4）+ 32/27（32）= 0..19 与 32..63
+check(
+  '汇总：非 2 幂长度区间按对齐边界拆分（/28 + /30）',
+  JSON.stringify(cidrsOf(summarizeRoutes([
+    member('a', '10.0.0.0/28'),
+    member('b', '10.0.0.16/30'),
+    member('c', '10.0.0.32/27'),
+  ]))) === JSON.stringify(['10.0.0.0/28', '10.0.0.16/30', '10.0.0.32/27']),
+)
+
+// 14h) 覆盖精确性：任何汇总 CIDR 都不得包含未选地址（空闲/保留）
+//  父 /24 中保留 0/28，选 16/30 与 32/27（中间 20–31 空闲），结果不得跨越间隙
+const gapCase = summarizeRoutes([member('a', '192.168.10.16/30'), member('b', '192.168.10.32/27')])
+check(
+  '汇总：跨越空闲间隙不得聚合成 16/27',
+  JSON.stringify(cidrsOf(gapCase)) === JSON.stringify(['192.168.10.16/30', '192.168.10.32/27']),
+  JSON.stringify(cidrsOf(gapCase)),
+)
+{
+  const chosen = mergeRanges(gapCase.flatMap((b) => b.members.map((m) => ({ start: m.start, end: m.end }))))
+  const noOverreach = gapCase.every((b) =>
+    chosen.some((r) => b.network >= r.start && b.network + b.size - 1 <= r.end),
+  )
+  check('汇总：每个 CIDR 完全落在所选并集内（无越界覆盖）', noOverreach)
+  check('汇总：总地址数与所选一致', blocksCoverExactly(gapCase, gapCase.flatMap((b) => b.members)))
+}
+
+// 14i) 示例规划全选：保留 0/28 不参与；自动 16/30、64/26、128/25 + 固定 32/27
+//  固定 32/27 + 自动 64/26 连续成 96 地址区间，但 32 仅对齐到 /27，
+//  故最省拆分是 32/27 + 64/26（32/26 不是合法对齐网络地址）
+{
+  const segMembers = selectableSegments(plan(demo)).map((s) => toMemberFromSegment(s))
+  const all = summarizeRoutes(segMembers)
+  check(
+    '示例全选：16/30 独立、32–127 拆为 32/27+64/26、128/25',
+    JSON.stringify(cidrsOf(all)) ===
+      JSON.stringify(['192.168.10.16/30', '192.168.10.32/27', '192.168.10.64/26', '192.168.10.128/25']),
+    JSON.stringify(cidrsOf(all)),
+  )
+  check('示例全选：地址总数=228（固定32+自动196），与各块之和相等', blocksCoverExactly(all, segMembers))
+  // 不得覆盖保留区 0..15 与唯一空闲间隙 20..31（128/25 已覆盖 192..255，属已选）
+  const forbidden = [
+    { start: ipToInt('192.168.10.0'), end: ipToInt('192.168.10.15') },
+    { start: ipToInt('192.168.10.20'), end: ipToInt('192.168.10.31') },
+  ]
+  const touchesForbidden = all.some((b) =>
+    forbidden.some((f) => b.network <= f.end && b.network + b.size - 1 >= f.start),
+  )
+  check('示例全选：汇总块不覆盖保留区与空闲区', !touchesForbidden)
+}
+
+// 14j) 部分选择：相邻的两个块只选其一，不得聚合
+check(
+  '汇总：只选相邻对的一个（64/26 不选 32/27）',
+  JSON.stringify(cidrsOf(summarizeRoutes([member('b', '192.168.10.64/26')]))) ===
+    JSON.stringify(['192.168.10.64/26']),
+)
+
+// 14k) 结果按网络地址升序，即便输入乱序
+check(
+  '汇总：输出按网络地址升序',
+  JSON.stringify(cidrsOf(summarizeRoutes([
+    member('c', '10.0.0.32/27'),
+    member('a', '10.0.0.0/30'),
+    member('b', '10.0.0.4/30'),
+  ]))) === JSON.stringify(['10.0.0.0/29', '10.0.0.32/27']),
+)
+
+// 14l) 可选网段只含成功分配的固定/自动（保留区、空闲、失败需求均排除）
+{
+  const withFail: PlannerInput = {
+    parentCidr: '192.168.10.0/28',
+    reservations: [{ id: 'r1', name: '保留', cidr: '192.168.10.0/29' }],
+    requirements: [
+      { id: 'big', name: '大需求', hosts: 100, cidr: '' },
+      { id: 'ok', name: '小需求', hosts: 2, cidr: '' },
+    ],
+  }
+  const wf = plan(withFail)
+  const ids = selectableSegments(wf).map((s) => s.ownerId)
+  check(
+    '可选网段排除保留/空闲/失败需求，仅保留成功分配项',
+    JSON.stringify(ids) === JSON.stringify(['ok']) && wf.failures.some((f) => f.id === 'big'),
+    JSON.stringify(ids),
+  )
+}
+
+// 14m) 成员信息透传：聚合块记录覆盖的原需求（名称与原 CIDR）
+{
+  const bs = summarizeRoutes([
+    member('a', '10.0.0.0/30', '链路A'),
+    member('b', '10.0.0.4/30', '链路B'),
+  ])
+  const memberIds = bs[0].members.map((m) => m.id).sort()
+  check('汇总块记录全部被覆盖原需求', bs.length === 1 && JSON.stringify(memberIds) === JSON.stringify(['a', 'b']))
+}
+
+// 14n) 随机属性测试：在 /24 内随机取若干 /30 网格块，汇总结果必须
+//  （a）与所选并集逐地址相等、（b）块数等于回溯法求得的最小可能块数
+{
+  // 确定性伪随机（LCG）
+  let seed = 0x1234abcd
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) % 0x80000000
+    return seed / 0x80000000
+  }
+  // 回溯 + 记忆化：在连续区间 [start,end]（相对 /24 起点，均 4 对齐）内
+  // 枚举起点处所有合法且不越界的 CIDR，求最少块数
+  const minBlocks = (start: number, end: number): number => {
+    const memo = new Map<number, number>()
+    const go = (cursor: number): number => {
+      if (cursor > end) return 0
+      const cached = memo.get(cursor)
+      if (cached !== undefined) return cached
+      let best = Infinity
+      for (let p = 30; p >= 24; p--) {
+        const size = 2 ** (32 - p)
+        if (cursor % size !== 0) continue
+        if (cursor + size - 1 > end) continue
+        best = Math.min(best, 1 + go(cursor + size))
+      }
+      memo.set(cursor, best)
+      return best
+    }
+    return go(start)
+  }
+  let trials = 0
+  let optimal = true
+  let exactAll = true
+  const base = ipToInt('172.20.5.0')
+  for (let t = 0; t < 200; t++) {
+    const chosen: SummaryMember[] = []
+    for (let i = 0; i < 64; i++) {
+      if (rnd() < 0.4) {
+        chosen.push(member(`m${i}`, `172.20.5.${i * 4}/30`))
+      }
+    }
+    if (chosen.length === 0) continue
+    trials++
+    const blocks = summarizeRoutes(chosen)
+    if (!blocksCoverExactly(blocks, chosen)) exactAll = false
+    // 合并相邻区间后逐段对比理论最小块数（所有区间相对 /24 起点仍保持对齐）
+    const ranges = mergeRanges(chosen.map((m) => ({ start: m.start, end: m.end })))
+    const theoretical = ranges.reduce((acc, r) => acc + minBlocks(r.start - base, r.end - base), 0)
+    if (blocks.length !== theoretical) {
+      optimal = false
+      break
+    }
+  }
+  check(`随机最优性（${trials} 组，块数均为最小）`, optimal && trials > 0, `trials=${trials}`)
+  check('随机精确覆盖（并集逐地址相等，无遗漏/越界）', exactAll)
+}
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)
 process.exit(failures === 0 ? 0 : 1)

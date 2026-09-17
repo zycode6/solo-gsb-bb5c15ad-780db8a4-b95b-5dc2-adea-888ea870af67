@@ -138,6 +138,29 @@ export interface AddrRange {
   end: number
 }
 
+/** 被勾选参与路由汇总的原需求网段（固定/自动） */
+export interface SummaryMember {
+  /** 需求稳定 ID（与 Segment.ownerId 一致） */
+  id: string
+  name: string
+  kind: 'fixed' | 'auto'
+  cidr: string
+  prefix: number
+  start: number
+  end: number
+}
+
+/** 路由汇总后的单个 CIDR 块 */
+export interface RouteSummaryBlock {
+  cidr: string
+  network: number
+  prefix: number
+  /** 地址数 = 2^(32-prefix) */
+  size: number
+  /** 该汇总块覆盖到的原需求网段（可能为多个被聚合的块） */
+  members: SummaryMember[]
+}
+
 export interface DiffSummary {
   /** 新占用：基线空闲、当前被占用的地址区间 */
   occupied: AddrRange[]
